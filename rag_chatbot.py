@@ -1,0 +1,182 @@
+import streamlit as st
+import json
+import os
+import requests
+import logging
+# Add LangChain imports
+from langchain.memory import ConversationBufferMemory
+# Add PyPDF import
+from pypdf import PdfReader
+
+# If running locally, load environment variables from .env
+from dotenv import load_dotenv
+load_dotenv()
+
+# Load context data from output.txt
+with open('output.txt', 'r', encoding='utf-8') as f:
+    context_data = json.load(f)
+
+# Read and extract text from all PDFs in the 'brochures' folder
+brochures_dir = 'brochures'
+try:
+    for filename in os.listdir(brochures_dir):
+        if filename.lower().endswith('.pdf'):
+            pdf_path = os.path.join(brochures_dir, filename)
+            pdf_text = ""
+            try:
+                reader = PdfReader(pdf_path)
+                for page in reader.pages:
+                    pdf_text += page.extract_text() or ""
+                if pdf_text.strip():
+                    # Add each PDF as an additional context entry
+                    context_data.append({
+                        'content': {filename: pdf_text[:10000]}  # Limit to first 10,000 chars for performance
+                    })
+            except Exception as e:
+                print(f"Error reading PDF {filename}: {e}")
+except Exception as e:
+    print(f"Error reading brochures directory: {e}")
+
+# Azure OpenAI config from environment variables
+AZURE_GPT41_URI = os.getenv('AZURE_GPT41_URI')
+AZURE_GPT41mini_URI = os.getenv('AZURE_GPT41mini_URI')
+AZURE_OPENAI_API_KEY = os.getenv('AZURE_OPENAI_API_KEY')
+AZURE_OPENAI_DEPLOYMENT = os.getenv('AZURE_OPENAI_DEPLOYMENT')
+#ZURE_OPENAI_API_VERSION = os.getenv('AZURE_OPENAI_API_VERSION', '2023-05-15')
+
+# Initialize conversation memory (in Streamlit session state)
+if 'memory' not in st.session_state:
+    st.session_state.memory = ConversationBufferMemory(return_messages=True)
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
+def find_relevant_context(query, context_data, top_k=3):
+    # Simple keyword search for demo; replace with embedding search for production
+    scored = []
+    for entry in context_data:
+        content = entry.get('content', {})
+        text = '\n'.join([f"{k}: {v}" for k, v in content.items()])
+        score = sum([text.lower().count(word) for word in query.lower().split()])
+        scored.append((score, text))
+    scored.sort(reverse=True)
+    return [text for score, text in scored[:top_k] if score > 0]
+
+def generate_rag_prompt(query, context_chunks, chat_history=None):
+    context = '\n---\n'.join(context_chunks)
+    history = ""
+    if chat_history:
+        # Format chat history for the prompt using .type and .content
+        history = "\n".join([
+            f"User: {msg.content}" if getattr(msg, 'type', None) == 'human' else f"Raj: {msg.content}" for msg in chat_history
+        ])
+        history = f"\nChat History:\n{history}\n"
+    prompt = f"""Your name is Raj. You are a friendly, expert real estate agent for Magic Bricks. Your goal is to provide comparison between multiple properties to the users. You will receive a document containing data on multiple properties (address, price, size, rooms, amenities, year built, neighbourhood info, photos, etc.). Your task is to:
+  
+  1. Unless the user wants to know about a specific property, identify the user's preferences by asking them short questions to narrow down property selection from your database. These will be conversational questions so the outputs need to be short. Also, you will not ask all these preference questions ina single output, you will ask them one by one while creating a casual and fun conversation.
+  2. Extract the relevant fields from the provided document.
+  3. After you have collected all the user preferences, compose a short, engaging description in natural language that's:
+     - Concise: Keep it under 5–7 sentences.
+     - Descriptive: Highlight location, layout, standout features, and lifestyle benefits.
+     - Accurate: Only state facts present in the data. If something isn't in the data, ask for clarification.
+     - Attach the property link as a hyperlink in the response.
+  4. Based on the user's input question, you should ask what they are looking for, for example, the budget, luxury style or other preferences, amenities they want, 2bhk/3bhk/4bhk etc.
+
+Warnings:
+You will not fabricate data.
+You will generate content for the responses strictly for the mentioned real estate properties if asked for.
+You will only provide content to the responses that is available in the document provided to you. 
+If the user wants to know the complete details of the property, you will prompt them to visit the property URLs and provide them with the respective URLs.
+
+You will be highly rewarded for following all the given instructions diligently.\n{history}\nContext:\n{context}\n\nQuestion: {query}\n\nAnswer:"""
+    return prompt
+
+def get_llm_response(prompt, target_uri, model_name):
+    api_key = AZURE_OPENAI_API_KEY
+    headers = {
+        "Content-Type": "application/json",
+        "api-key": api_key
+    }
+    data = {
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.03,
+        "max_tokens": 1024
+    }
+    logger.info(f"Using model: {model_name} | URI: {target_uri}")
+    logger.debug(f"Prompt sent to LLM: {prompt}")
+    response = requests.post(target_uri, headers=headers, json=data)
+    response.raise_for_status()
+    result = response.json()['choices'][0]['message']['content']
+    logger.debug(f"Response from LLM: {result}")
+    return result
+
+st.title("Raj AI by Magic Bricks")
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+    # Add Raj's first message to the chat history
+    first_message = "Hi, I'm Raj from Magic Bricks. What kind of property are you looking for today?"
+    st.session_state.chat_history.append((None, first_message))
+    # Also add to memory as an AI message for consistency
+    if 'memory' in st.session_state:
+        st.session_state.memory.chat_memory.add_ai_message(first_message)
+    # Start in preference mode
+    st.session_state.preference_mode = True
+
+# Helper function to detect if a message is a preference question
+PREFERENCE_KEYWORDS = [
+    "looking for", "budget", "location", "type", "amenities", "bhk", "preferences", "property", "what kind of property", "what are you looking for"
+]
+def is_preference_message(message):
+    if not message:
+        return False
+    msg_lower = message.lower()
+    return any(keyword in msg_lower for keyword in PREFERENCE_KEYWORDS)
+
+# Helper: Simulate preference collection (e.g., after 3+ user turns, or you can make this more advanced)
+def preferences_are_collected(chat_history):
+    # Count user messages that look like preferences (for demo, just count user turns)
+    user_msgs = [msg for msg in chat_history if getattr(msg, 'type', None) == 'human']
+    return len(user_msgs) >= 3  # You can adjust this threshold
+
+# Helper: Detect if user is asking for a specific property
+PROPERTY_DETAIL_KEYWORDS = ["details", "show me", "about property", "property at", "tell me more", "full info", "complete info", "address is"]
+def is_property_details_query(user_input):
+    if not user_input:
+        return False
+    msg_lower = user_input.lower()
+    return any(keyword in msg_lower for keyword in PROPERTY_DETAIL_KEYWORDS)
+
+user_input = st.chat_input("Ask a question about Bangalore real estate data")
+if user_input:
+    # Add user message to memory
+    st.session_state.memory.chat_memory.add_user_message(user_input)
+    # Prepare chat history for context
+    chat_history = st.session_state.memory.chat_memory.messages
+    # Decide if we should use RAG (and gpt-4.1 mini)
+    preferences_done = preferences_are_collected(chat_history)
+    property_details = is_property_details_query(user_input)
+    use_rag = preferences_done or property_details
+    if use_rag:
+        context_chunks = find_relevant_context(user_input, context_data)
+        rag_prompt = generate_rag_prompt(user_input, context_chunks, chat_history=chat_history)
+        answer = get_llm_response(rag_prompt, AZURE_GPT41mini_URI, "gpt-4.1-mini")
+    else:
+        # No RAG, just conversational prompt
+        rag_prompt = generate_rag_prompt(user_input, [], chat_history=chat_history)
+        answer = get_llm_response(rag_prompt, AZURE_GPT41_URI, "gpt-4.1")
+    # Add assistant message to memory
+    st.session_state.memory.chat_memory.add_ai_message(answer)
+    st.session_state.chat_history.append((user_input, answer))
+    # Update preference_mode for next turn (optional, for future use)
+    st.session_state.preference_mode = is_preference_message(answer)
+
+st.markdown("---")
+st.subheader("Chat History")
+for q, a in st.session_state.chat_history:
+    st.markdown(f"**You:** {q}")
+    st.markdown(f"**Raj:** {a}") 

@@ -1,0 +1,6 @@
+streamlit
+openai
+azure-identity
+requests
+beautifulsoup4
+langchain 
