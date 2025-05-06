@@ -3,6 +3,7 @@ import json
 import os
 import requests
 import logging
+import re
 # Add LangChain imports
 from langchain.memory import ConversationBufferMemory
 # Add PyPDF import
@@ -15,6 +16,10 @@ load_dotenv()
 # Load context data from output.txt
 with open('output.txt', 'r', encoding='utf-8') as f:
     context_data = json.load(f)
+
+# Load property URLs from urls.txt
+with open('urls.txt', 'r', encoding='utf-8') as f:
+    all_urls = [line.strip() for line in f if line.strip()]
 
 # Read and extract text from all PDFs in the 'brochures' folder
 brochures_dir = 'brochures'
@@ -59,9 +64,9 @@ def find_relevant_context(query, context_data, top_k=3):
         content = entry.get('content', {})
         text = '\n'.join([f"{k}: {v}" for k, v in content.items()])
         score = sum([text.lower().count(word) for word in query.lower().split()])
-        scored.append((score, text))
+        scored.append((score, entry))  # Return the whole entry, not just text
     scored.sort(reverse=True)
-    return [text for score, text in scored[:top_k] if score > 0]
+    return [entry for score, entry in scored[:top_k] if score > 0]
 
 def generate_rag_prompt(query, context_chunks, chat_history=None):
     context = '\n---\n'.join(context_chunks)
@@ -72,7 +77,7 @@ def generate_rag_prompt(query, context_chunks, chat_history=None):
             f"User: {msg.content}" if getattr(msg, 'type', None) == 'human' else f"Raj: {msg.content}" for msg in chat_history
         ])
         history = f"\nChat History:\n{history}\n"
-    prompt = f"""Your name is Raj. You are a friendly, expert real estate agent for Magic Bricks. Your goal is to provide comparison between multiple properties to the users. You will receive a document containing data on multiple properties (address, price, size, rooms, amenities, year built, neighbourhood info, photos, etc.). Your task is to:
+    prompt = f"""Your name is Raj. You speak in Hinglish language by default. You are a friendly, expert real estate agent for Magic Bricks. Your goal is to provide comparison between multiple properties to the users. You will receive a document containing data on multiple properties (address, price, size, rooms, amenities, year built, neighbourhood info, photos, etc.). Your task is to:
   
   1. Unless the user wants to know about a specific property, identify the user's preferences by asking them short questions to narrow down property selection from your database. These will be conversational questions so the outputs need to be short. Also, you will not ask all these preference questions ina single output, you will ask them one by one while creating a casual and fun conversation.
   2. Extract the relevant fields from the provided document.
@@ -144,7 +149,7 @@ def preferences_are_collected(chat_history):
     return len(user_msgs) >= 3  # You can adjust this threshold
 
 # Helper: Detect if user is asking for a specific property
-PROPERTY_DETAIL_KEYWORDS = ["details", "show me", "about property", "property at", "tell me more", "full info", "complete info", "address is"]
+PROPERTY_DETAIL_KEYWORDS = ["details", "show me", "about property", "property at", "tell me more", "full info", "complete info", "address is", "saare dikhao"]
 def is_property_details_query(user_input):
     if not user_input:
         return False
@@ -162,13 +167,62 @@ if user_input:
     property_details = is_property_details_query(user_input)
     use_rag = preferences_done or property_details
     if use_rag:
-        context_chunks = find_relevant_context(user_input, context_data)
+        relevant_properties = find_relevant_context(user_input, context_data)
+        context_chunks = [
+            '\n'.join([f"{k}: {v}" for k, v in prop.get('content', {}).items()])
+            for prop in relevant_properties
+        ]
+        urls = [prop.get('url') for prop in relevant_properties if 'url' in prop]
+        property_names = []
+        property_images = []  # Collect images for each property
+        property_urls = []    # Collect URLs for each property
+        for prop in relevant_properties:
+            # Try to extract a property name from the content keys
+            content_keys = list(prop.get('content', {}).keys())
+            if content_keys:
+                property_names.append(content_keys[0])
+            else:
+                property_names.append(None)
+            # Extract images
+            images = prop.get('content', {}).get('images', [])
+            if isinstance(images, str):
+                images = [images]
+            property_images.append(images)
+            # Fetch url from urls.txt by matching property name
+            url_found = None
+            prop_name = content_keys[0] if content_keys else None
+            if prop_name:
+                for u in all_urls:
+                    if prop_name.lower().replace(' ', '-') in u.lower():
+                        url_found = u
+                        break
+            property_urls.append(url_found)
         rag_prompt = generate_rag_prompt(user_input, context_chunks, chat_history=chat_history)
         answer = get_llm_response(rag_prompt, AZURE_GPT41mini_URI, "gpt-4.1-mini")
+        # Replace property names with markdown hyperlinks in the answer
+        for name, url in zip(property_names, property_urls):
+            if name and url:
+                # Only replace if not already a markdown link
+                answer = re.sub(rf'(?<!\[){re.escape(name)}(?!\])', f'[{name}]({url})', answer)
+        # Replace any URLs in the answer and insert the correct property URL after each property mention (legacy)
+        def insert_links_per_property(text, property_names, urls):
+            text = re.sub(r'\[([^\]]+)\]\((https?://[^)]+)\)', r'\1', text)
+            text = re.sub(r'https?://\S+', '', text)
+            for name, url in zip(property_names, urls):
+                if name and url:
+                    pattern = re.escape(name)
+                    replacement = f"{name} [View Property Page]({url})"
+                    text = re.sub(pattern, replacement, text, count=1)
+            return text
+        # answer = insert_links_per_property(answer, property_names, urls)  # No longer needed, replaced by above
+        st.session_state["last_property_images"] = property_images
+        st.session_state["last_property_names"] = property_names
+        st.session_state["last_property_urls"] = property_urls
     else:
         # No RAG, just conversational prompt
         rag_prompt = generate_rag_prompt(user_input, [], chat_history=chat_history)
         answer = get_llm_response(rag_prompt, AZURE_GPT41_URI, "gpt-4.1")
+        st.session_state["last_property_images"] = []  # No images for non-RAG
     # Add assistant message to memory
     st.session_state.memory.chat_memory.add_ai_message(answer)
     st.session_state.chat_history.append((user_input, answer))
@@ -177,6 +231,65 @@ if user_input:
 
 st.markdown("---")
 st.subheader("Chat History")
-for q, a in st.session_state.chat_history:
+for idx, (q, a) in enumerate(st.session_state.chat_history):
     st.markdown(f"**You:** {q}")
-    st.markdown(f"**Raj:** {a}") 
+    # For the most recent LLM response, group text and images together
+    if idx == len(st.session_state.chat_history) - 1:
+        property_images = st.session_state.get("last_property_images", [])
+        property_names = st.session_state.get("last_property_names", []) if "last_property_names" in st.session_state else []
+        property_urls = st.session_state.get("last_property_urls", []) if "last_property_urls" in st.session_state else []
+        import re
+        # Generalized logic for any number of numbered properties
+        numbered_pattern = r'(\n|^)(\d+)\. '
+        splits = [m.start() for m in re.finditer(numbered_pattern, a)]
+        # Always include the start
+        if splits and splits[0] != 0:
+            splits = [0] + splits
+        # If the number of splits matches the number of image sets, display accordingly
+        if len(splits) > 1 and len(splits) - 1 == len(property_images):
+            with st.container():
+                for i in range(len(property_images)):
+                    part = a[splits[i]:splits[i+1]] if i+1 < len(splits) else a[splits[i]:]
+                    st.markdown(f"**Raj:** {part}")
+                    if property_images[i]:
+                        valid_images = [img for img in property_images[i] if isinstance(img, str) and img.strip()]
+                        if valid_images:
+                            st.image(valid_images, width=200)
+                # Add the last part if any
+                if len(splits) > len(property_images):
+                    st.markdown(f"**Raj:** {a[splits[-1]:]}")
+        # Try to insert images below each property mention (fallback)
+        elif property_names and property_images and any(property_names):
+            answer = a
+            from streamlit import markdown, image
+            last_pos = 0
+            output_chunks = []
+            for name, images in zip(property_names, property_images):
+                if not name or not images:
+                    continue
+                match = re.search(re.escape(name), answer[last_pos:], re.IGNORECASE)
+                if match:
+                    start = last_pos + match.start()
+                    end = last_pos + match.end()
+                    output_chunks.append(answer[last_pos:end])
+                    output_chunks.append(("IMAGES", images))
+                    last_pos = end
+            output_chunks.append(answer[last_pos:])
+            with st.container():
+                for chunk in output_chunks:
+                    if isinstance(chunk, tuple) and chunk[0] == "IMAGES":
+                        imgs = chunk[1]
+                        valid_images = [img for img in imgs if isinstance(img, str) and img.strip()]
+                        if valid_images:
+                            st.image(valid_images, width=200)
+                    else:
+                        st.markdown(f"**Raj:** {chunk}")
+        else:
+            with st.container():
+                st.markdown(f"**Raj:** {a}")
+                for images in property_images:
+                    valid_images = [img for img in images if isinstance(img, str) and img.strip()]
+                    if valid_images:
+                        st.image(valid_images, width=200)
+    else:
+        st.markdown(f"**Raj:** {a}") 
