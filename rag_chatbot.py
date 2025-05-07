@@ -65,7 +65,8 @@ def find_relevant_context(query, context_data, top_k=3):
         text = '\n'.join([f"{k}: {v}" for k, v in content.items()])
         score = sum([text.lower().count(word) for word in query.lower().split()])
         scored.append((score, entry))  # Return the whole entry, not just text
-    scored.sort(reverse=True)
+    # Sort by score only, ignoring the entry dictionary
+    scored.sort(key=lambda x: x[0], reverse=True)
     return [entry for score, entry in scored[:top_k] if score > 0]
 
 def generate_rag_prompt(query, context_chunks, chat_history=None):
