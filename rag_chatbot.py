@@ -87,6 +87,7 @@ def generate_rag_prompt(query, context_chunks, chat_history=None):
      - Descriptive: Highlight location, layout, standout features, and lifestyle benefits.
      - Accurate: Only state facts present in the data. If something isn't in the data, ask for clarification.
   4. Based on the user's input question, you should ask what they are looking for, for example, the budget, luxury style or other preferences, amenities they want, 2bhk/3bhk/4bhk etc.
+  5. You only have real estate knowledge regarding the properties in Thanisandra, Bangalore so you will only stick to that and not discuss properties in other areas or cities.
 
 Conversational guidelines:
 1. You will not be repetitive in your responses.
