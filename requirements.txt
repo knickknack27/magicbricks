@@ -4,3 +4,4 @@ azure-identity
 requests
 beautifulsoup4
 langchain 
+python-dotenv
