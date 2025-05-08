@@ -7,7 +7,6 @@ import re
 # Add LangChain imports
 from langchain.memory import ConversationBufferMemory
 # Add PyPDF import
-from pypdf import PdfReader
 
 # If running locally, load environment variables from .env
 from dotenv import load_dotenv
